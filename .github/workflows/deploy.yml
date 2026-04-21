@@ -12,10 +12,10 @@ env:
 
 jobs:
   # ─────────────────────────────────────────────────────────────
-  # JOB 1 — CI
+  # JOB 1 — Prepare Deployment
   # ─────────────────────────────────────────────────────────────
-  ci:
-    name: CI
+  prepare-deployment:
+    name: prepare-deployment
     runs-on: ubuntu-latest
 
     steps:
@@ -40,7 +40,7 @@ jobs:
   deploy-frontend:
     name: Deploy Frontend (S3 + CloudFront)
     runs-on: ubuntu-latest
-    needs: ci
+    needs: prepare-deployment
     if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
 
     steps:
