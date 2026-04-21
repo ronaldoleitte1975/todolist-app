@@ -1,4 +1,4 @@
-import react from '@vitejs/plugin-react'
+import { useState, useEffect } from "react";
 
 // ─── Substitua pela URL gerada no API Gateway ───────────────
 const API_URL = "https://lvfh1hfft9.execute-api.us-east-1.amazonaws.com/prod/tasks";
