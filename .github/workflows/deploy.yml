@@ -1,0 +1,202 @@
+name: CI/CD - Todo List
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [develop]
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: todo-app-prod
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # JOB 1 — Testes
+  # ─────────────────────────────────────────────────────────────
+  test:
+    name: CI-CD
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.16
+          cache: npm
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Checar build (lint)
+        run: npm run build
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 2 — Deploy React no S3 + CloudFront
+  # ─────────────────────────────────────────────────────────────
+  deploy-frontend:
+    name: Deploy Frontend (S3 + CloudFront)
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.16
+          cache: npm
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Buscar URL da API no CloudFormation
+        id: api-url
+        run: |
+          API_URL=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
+            --output text)
+          echo "API_URL=$API_URL" >> $GITHUB_OUTPUT
+          echo "API URL encontrada: $API_URL"
+
+      - name: Substituir API_URL no código
+        run: |
+          sed -i "s|https://SEU-ID.execute-api.us-east-1.amazonaws.com/prod/tasks|${{ steps.api-url.outputs.API_URL }}|g" src/App.jsx
+
+      - name: Build do React
+        run: npm run build
+        env:
+          VITE_API_URL: ${{ steps.api-url.outputs.API_URL }}
+
+      - name: Buscar nome do bucket S3
+        id: s3-bucket
+        run: |
+          BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='S3BucketName'].OutputValue" \
+            --output text)
+          echo "BUCKET=$BUCKET" >> $GITHUB_OUTPUT
+          echo "Bucket: $BUCKET"
+
+      - name: Upload para o S3 (assets com cache longo)
+        run: |
+          aws s3 sync dist/ s3://${{ steps.s3-bucket.outputs.BUCKET }} \
+            --delete \
+            --cache-control "public, max-age=31536000" \
+            --exclude "index.html"
+
+      - name: Upload index.html (sem cache)
+        run: |
+          aws s3 cp dist/index.html s3://${{ steps.s3-bucket.outputs.BUCKET }}/index.html \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+      - name: Invalidar cache do CloudFront
+        run: |
+          CF_ID=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='CloudFrontId'].OutputValue" \
+            --output text)
+          aws cloudfront create-invalidation \
+            --distribution-id $CF_ID \
+            --paths "/*"
+          echo "Cache invalidado na distribuição: $CF_ID"
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 3 — Deploy Lambda
+  # ─────────────────────────────────────────────────────────────
+  deploy-lambda:
+    name: Deploy Lambda
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.16
+          cache: npm
+
+      - name: Instalar dependências da Lambda
+        working-directory: lambda
+        run: npm ci
+
+      - name: Empacotar Lambda (zip)
+        working-directory: lambda
+        run: zip -r ../lambda-deploy.zip index.js node_modules package.json
+
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Buscar nome da Lambda no CloudFormation
+        id: lambda-name
+        run: |
+          LAMBDA=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='LambdaFunctionName'].OutputValue" \
+            --output text)
+          echo "LAMBDA=$LAMBDA" >> $GITHUB_OUTPUT
+          echo "Lambda: $LAMBDA"
+
+      - name: Atualizar código da Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name ${{ steps.lambda-name.outputs.LAMBDA }} \
+            --zip-file fileb://lambda-deploy.zip \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Aguardar atualização da Lambda
+        run: |
+          aws lambda wait function-updated \
+            --function-name ${{ steps.lambda-name.outputs.LAMBDA }} \
+            --region ${{ env.AWS_REGION }}
+          echo "Lambda atualizada com sucesso!"
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 4 — Notificação final
+  # ─────────────────────────────────────────────────────────────
+  notify:
+    name: Notificação
+    runs-on: ubuntu-latest
+    needs: [deploy-frontend, deploy-lambda]
+    if: always() && github.event_name == 'push'
+
+    steps:
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Exibir URL do app
+        run: |
+          CF_URL=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='CloudFrontUrl'].OutputValue" \
+            --output text)
+          echo "========================================"
+          echo " Deploy concluido!"
+          echo " App disponivel em: $CF_URL"
+          echo "========================================"
